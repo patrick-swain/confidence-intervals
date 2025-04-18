@@ -1,0 +1,429 @@
+---
+title: "Alistair Assignment 2"
+output: html_document
+date: "2025-04-18"
+---
+
+```{r}
+# Simulation to compare confidence intervals from bootstrap and standard inference
+# for a Poisson GLM model
+
+library(dplyr)
+library(ggplot2)
+library(boot)
+library(gridExtra)
+library(tidyr)
+set.seed(42)
+
+# Function 1: Generate random data for the Poisson GLM model
+generate_data <- function(N) {
+  # Generate the binary predictor (delta) with 60% probability of being 1
+  delta <- rbinom(N, 1, 0.6)
+  
+  # Generate x based on chi-squared distributions - 4 df when delta=1, 2 df when delta=0
+  x <- ifelse(delta == 1, rchisq(N, df = 4), rchisq(N, df = 2))
+  
+  # True parameter values
+  beta0 <- -1
+  beta1 <- -1
+  beta2 <- 1/2
+  
+  # Calculate lambda (mean of Poisson)
+  lambda <- exp(beta0 + beta1 * delta + beta2 * x)
+  
+  # Generate Poisson outcomes
+  y <- rpois(N, lambda)
+  
+  # Return data frame
+  data.frame(y = y, delta = delta, x = x)
+}
+
+# Calculate transformation probability (y < 2 when delta=1 and x=4)
+calculate_transformation <- function(beta0, beta1, beta2) {
+  lambda <- exp(beta0 + beta1 * 1 + beta2 * 4)
+  ppois(1, lambda)  # P(Y ≤ 1) = P(Y = 0) + P(Y = 1)
+}
+
+# Function 2: Conduct GLM estimate and compute standard confidence intervals
+standard_inference <- function(data, conf_level = 0.95) {
+  # Fit Poisson GLM
+  model <- glm(y ~ delta + x, family = poisson(link = "log"), data = data)
+  
+  # Extract coefficients
+  coefs <- coef(model)
+  beta0 <- coefs["(Intercept)"]
+  beta1 <- coefs["delta"]
+  beta2 <- coefs["x"]
+  
+  # Calculate standard errors
+  vcov_matrix <- vcov(model)
+  se <- sqrt(diag(vcov_matrix))
+  
+  # Calculate confidence intervals for coefficients
+  alpha <- 1 - conf_level
+  z_critical <- qnorm(1 - alpha/2)
+  
+  ci_beta0 <- c(beta0 - z_critical * se["(Intercept)"], beta0 + z_critical * se["(Intercept)"])
+  ci_beta1 <- c(beta1 - z_critical * se["delta"], beta1 + z_critical * se["delta"])
+  ci_beta2 <- c(beta2 - z_critical * se["x"], beta2 + z_critical * se["x"])
+  
+  # Calculate transformation and its confidence interval using delta method
+  # Transformation: P(Y < 2) when delta=1 and x=4
+  transformation <- calculate_transformation(beta0, beta1, beta2)
+  
+  # Compute gradient of transformation with respect to parameters
+  lambda <- exp(beta0 + beta1 * 1 + beta2 * 4)
+  d_beta0 <- -lambda * (dpois(0, lambda) + dpois(1, lambda))
+  d_beta1 <- -lambda * (dpois(0, lambda) + dpois(1, lambda))
+  d_beta2 <- -4 * lambda * (dpois(0, lambda) + dpois(1, lambda))
+  
+  gradient <- c(d_beta0, d_beta1, d_beta2)
+  
+  # Variance of transformation using delta method
+  var_transformation <- t(gradient) %*% vcov_matrix %*% gradient
+  se_transformation <- sqrt(as.numeric(var_transformation))
+  
+  # CI for transformation
+  ci_transformation <- c(transformation - z_critical * se_transformation, 
+                         transformation + z_critical * se_transformation)
+  
+  # Return all estimates and CIs
+  list(
+    beta0 = beta0,
+    beta1 = beta1,
+    beta2 = beta2,
+    transformation = transformation,
+    ci_beta0 = ci_beta0,
+    ci_beta1 = ci_beta1,
+    ci_beta2 = ci_beta2,
+    ci_transformation = ci_transformation
+  )
+}
+
+# Function 3: Bootstrap estimates and confidence intervals
+bootstrap_inference <- function(data, conf_level = 0.95, R = 1000) {
+  # Define bootstrap function for the GLM
+  boot_function <- function(data, indices) {
+    boot_data <- data[indices, ]
+    
+    # Fit GLM on bootstrap sample
+    boot_model <- tryCatch({
+      glm(y ~ delta + x, family = poisson(link = "log"), data = boot_data)
+    }, error = function(e) {
+      return(NULL)
+    })
+    
+    if (is.null(boot_model)) {
+      return(rep(NA, 4))
+    }
+    
+    # Extract coefficients
+    coefs <- coef(boot_model)
+    beta0 <- coefs["(Intercept)"]
+    beta1 <- coefs["delta"]
+    beta2 <- coefs["x"]
+    
+    # Calculate transformation
+    transformation <- calculate_transformation(beta0, beta1, beta2)
+    
+    # Return parameters and transformation
+    c(beta0, beta1, beta2, transformation)
+  }
+  
+  # Run bootstrap
+  boot_results <- boot(data, boot_function, R = R)
+  
+  # Calculate bootstrap confidence intervals
+  alpha <- 1 - conf_level
+  
+  # Basic bootstrap CIs for each parameter
+  ci_beta0 <- boot.ci(boot_results, type = "perc", index = 1, conf = conf_level)$percent[4:5]
+  ci_beta1 <- boot.ci(boot_results, type = "perc", index = 2, conf = conf_level)$percent[4:5]
+  ci_beta2 <- boot.ci(boot_results, type = "perc", index = 3, conf = conf_level)$percent[4:5]
+  ci_transformation <- boot.ci(boot_results, type = "perc", index = 4, conf = conf_level)$percent[4:5]
+  
+  # Get original estimates
+  model <- glm(y ~ delta + x, family = poisson(link = "log"), data = data)
+  coefs <- coef(model)
+  beta0 <- coefs["(Intercept)"]
+  beta1 <- coefs["delta"]
+  beta2 <- coefs["x"]
+  transformation <- calculate_transformation(beta0, beta1, beta2)
+  
+  # Return all estimates and CIs
+  list(
+    beta0 = beta0,
+    beta1 = beta1,
+    beta2 = beta2,
+    transformation = transformation,
+    ci_beta0 = ci_beta0,
+    ci_beta1 = ci_beta1,
+    ci_beta2 = ci_beta2,
+    ci_transformation = ci_transformation
+  )
+}
+
+# Function to run a single simulation
+run_simulation <- function(N, conf_level, n_sims = 500) {
+  # True parameter values for comparison
+  true_beta0 <- -1
+  true_beta1 <- -1
+  true_beta2 <- 1/2
+  true_transformation <- calculate_transformation(true_beta0, true_beta1, true_beta2)
+  
+  # Containers for results
+  std_covered_beta0 <- 0
+  std_covered_beta1 <- 0
+  std_covered_beta2 <- 0
+  std_covered_transform <- 0
+  
+  boot_covered_beta0 <- 0
+  boot_covered_beta1 <- 0
+  boot_covered_beta2 <- 0
+  boot_covered_transform <- 0
+  
+  for (i in 1:n_sims) {
+    # Generate data
+    data <- generate_data(N)
+    
+    # Standard inference
+    std_results <- standard_inference(data, conf_level)
+    
+    # Bootstrap inference (with fewer replicates for efficiency)
+    boot_reps <- min(1000, max(200, N))  # Scale bootstrap replicates with sample size
+    boot_results <- bootstrap_inference(data, conf_level, R = boot_reps)
+    
+    # Check if true values are in confidence intervals
+    # Standard method
+    std_covered_beta0 <- std_covered_beta0 + 
+      (std_results$ci_beta0[1] <= true_beta0 && std_results$ci_beta0[2] >= true_beta0)
+    
+    std_covered_beta1 <- std_covered_beta1 + 
+      (std_results$ci_beta1[1] <= true_beta1 && std_results$ci_beta1[2] >= true_beta1)
+    
+    std_covered_beta2 <- std_covered_beta2 + 
+      (std_results$ci_beta2[1] <= true_beta2 && std_results$ci_beta2[2] >= true_beta2)
+    
+    std_covered_transform <- std_covered_transform + 
+      (std_results$ci_transformation[1] <= true_transformation && 
+         std_results$ci_transformation[2] >= true_transformation)
+    
+    # Bootstrap method
+    boot_covered_beta0 <- boot_covered_beta0 + 
+      (boot_results$ci_beta0[1] <= true_beta0 && boot_results$ci_beta0[2] >= true_beta0)
+    
+    boot_covered_beta1 <- boot_covered_beta1 + 
+      (boot_results$ci_beta1[1] <= true_beta1 && boot_results$ci_beta1[2] >= true_beta1)
+    
+    boot_covered_beta2 <- boot_covered_beta2 + 
+      (boot_results$ci_beta2[1] <= true_beta2 && boot_results$ci_beta2[2] >= true_beta2)
+    
+    boot_covered_transform <- boot_covered_transform + 
+      (boot_results$ci_transformation[1] <= true_transformation && 
+         boot_results$ci_transformation[2] >= true_transformation)
+    
+    # Progress update every 10%
+    if (i %% max(1, floor(n_sims/10)) == 0) {
+      cat(sprintf("N=%d, conf=%.2f: %d%% complete\n", N, conf_level, round(100*i/n_sims)))
+    }
+  }
+  
+  # Convert to proportions of non-coverage (Type I error rates)
+  std_type1_beta0 <- 1 - std_covered_beta0/n_sims
+  std_type1_beta1 <- 1 - std_covered_beta1/n_sims
+  std_type1_beta2 <- 1 - std_covered_beta2/n_sims
+  std_type1_transform <- 1 - std_covered_transform/n_sims
+  
+  boot_type1_beta0 <- 1 - boot_covered_beta0/n_sims
+  boot_type1_beta1 <- 1 - boot_covered_beta1/n_sims
+  boot_type1_beta2 <- 1 - boot_covered_beta2/n_sims
+  boot_type1_transform <- 1 - boot_covered_transform/n_sims
+  
+  # Return results
+  data.frame(
+    N = N,
+    conf_level = conf_level,
+    expected_type1 = 1 - conf_level,
+    std_type1_beta0 = std_type1_beta0,
+    std_type1_beta1 = std_type1_beta1, 
+    std_type1_beta2 = std_type1_beta2,
+    std_type1_transform = std_type1_transform,
+    boot_type1_beta0 = boot_type1_beta0,
+    boot_type1_beta1 = boot_type1_beta1,
+    boot_type1_beta2 = boot_type1_beta2,
+    boot_type1_transform = boot_type1_transform
+  )
+}
+
+# Set up simulation parameters
+sample_sizes <- c(50, 100, 200, 400, 800, 1600)
+conf_levels <- c(0.80, 0.90, 0.95)
+n_sims <- 200  # Number of simulations for each combination (adjust as needed)
+
+# Run simulations
+results <- data.frame()
+
+for (N in sample_sizes) {
+  for (conf_level in conf_levels) {
+    cat(sprintf("Starting simulation for N=%d, confidence level=%.2f\n", N, conf_level))
+    sim_result <- run_simulation(N, conf_level, n_sims)
+    results <- rbind(results, sim_result)
+    cat(sprintf("Completed simulation for N=%d, confidence level=%.2f\n", N, conf_level))
+  }
+}
+
+# Prepare data for visualization
+results_long <- results %>%
+  pivot_longer(
+    cols = starts_with(c("std_", "boot_")),
+    names_to = "parameter", 
+    values_to = "type1_error"
+  ) %>%
+  mutate(
+    method = ifelse(grepl("^std_", parameter), "Standard Inference", "Bootstrap"),
+    parameter = gsub("^std_type1_|^boot_type1_", "", parameter)
+  )
+```
+
+
+```{r}
+# Create visualizations with individual file saving
+# 1. Type-I errors for each coefficient by sample size
+plot_coefficients <- function(data, conf_level) {
+  filtered_data <- data %>% 
+    filter(conf_level == !!conf_level, 
+           parameter %in% c("beta0", "beta1", "beta2"))
+  
+  p <- ggplot(filtered_data, aes(x = factor(N), y = type1_error, 
+                           color = method, shape = parameter, group = interaction(method, parameter))) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_hline(aes(yintercept = expected_type1), linetype = "dashed") +
+    scale_y_continuous(limits = c(0, min(0.4, max(filtered_data$type1_error) * 1.2))) +
+    labs(
+      title = paste0(conf_level * 100, "% Confidence Intervals - Coefficient Type I Error Rates"),
+      x = "Sample Size",
+      y = "Type I Error Rate",
+      color = "Method",
+      shape = "Parameter"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+  
+  # Save the plot to a file
+  filename <- sprintf("coefficients_ci_%d_percent.png", conf_level * 100)
+  ggsave(filename, p, width = 8, height = 6, dpi = 300)
+  
+  # Also save as PDF for publication-quality
+  filename_pdf <- sprintf("coefficients_ci_%d_percent.pdf", conf_level * 100)
+  ggsave(filename_pdf, p, width = 8, height = 6)
+  
+  return(p)
+}
+
+# 2. Type-I errors for transformation by sample size
+plot_transformation <- function(data, conf_level) {
+  filtered_data <- data %>% 
+    filter(conf_level == !!conf_level, 
+           parameter == "transform")
+  
+  p <- ggplot(filtered_data, aes(x = factor(N), y = type1_error, 
+                           color = method, group = method)) +
+    geom_point(size = 3) +
+    geom_line() +
+    geom_hline(aes(yintercept = expected_type1), linetype = "dashed") +
+    scale_y_continuous(limits = c(0, min(0.4, max(filtered_data$type1_error) * 1.2))) +
+    labs(
+      title = paste0(conf_level * 100, "% Confidence Intervals - Transformation Type I Error Rates"),
+      subtitle = "P(Y < 2) when delta=1 and x=4",
+      x = "Sample Size",
+      y = "Type I Error Rate",
+      color = "Method"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+  
+  # Save the plot to a file
+  filename <- sprintf("transformation_ci_%d_percent.png", conf_level * 100)
+  ggsave(filename, p, width = 8, height = 6, dpi = 300)
+  
+  # Also save as PDF for publication-quality
+  filename_pdf <- sprintf("transformation_ci_%d_percent.pdf", conf_level * 100)
+  ggsave(filename_pdf, p, width = 8, height = 6)
+  
+  return(p)
+}
+
+# Generate and save plots for each confidence level
+cat("Generating and saving individual plots...\n")
+
+# 80% confidence level plots
+plots_80 <- list(
+  coef = plot_coefficients(results_long, 0.80),
+  trans = plot_transformation(results_long, 0.80)
+)
+cat("80% confidence level plots saved.\n")
+
+# 90% confidence level plots
+plots_90 <- list(
+  coef = plot_coefficients(results_long, 0.90),
+  trans = plot_transformation(results_long, 0.90)
+)
+cat("90% confidence level plots saved.\n")
+
+# 95% confidence level plots
+plots_95 <- list(
+  coef = plot_coefficients(results_long, 0.95),
+  trans = plot_transformation(results_long, 0.95)
+)
+cat("95% confidence level plots saved.\n")
+
+# Additionally create a combined view of all plots
+combined_plots <- list(
+  plots_80$coef, plots_80$trans,
+  plots_90$coef, plots_90$trans,
+  plots_95$coef, plots_95$trans
+)
+
+# Save combined plot as well
+combined_plot <- gridExtra::arrangeGrob(grobs = combined_plots, ncol = 2)
+ggsave("all_plots_combined.png", combined_plot, width = 12, height = 18, dpi = 300)
+ggsave("all_plots_combined.pdf", combined_plot, width = 12, height = 18)
+cat("Combined plot saved.\n")
+
+# Print plots for display in the environment
+print(plots_80$coef)
+print(plots_80$trans)
+print(plots_90$coef)
+print(plots_90$trans)
+print(plots_95$coef)
+print(plots_95$trans)
+
+# Create a comprehensive summary table
+summary_table <- results %>%
+  select(N, conf_level, expected_type1, 
+         std_type1_beta0, boot_type1_beta0,
+         std_type1_beta1, boot_type1_beta1,
+         std_type1_beta2, boot_type1_beta2,
+         std_type1_transform, boot_type1_transform)
+
+# Save the summary table to a CSV file
+write.csv(summary_table, "summary_results.csv", row.names = FALSE)
+cat("Summary table saved to 'summary_results.csv'\n")
+
+print(summary_table)
+```
+```{r}
+save(results, file = "confint_results.rda")
+save(plots_80, file = "plots_80.png")
+save(plots_90, file = "plots_80.png")
+save(plots_95, file = "plots_80.png")
+```
+
